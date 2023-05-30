@@ -1,0 +1,255 @@
+---
+title: "Spring2023_Proj"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+setwd('/home2/geyie/BIcourse/2023_1')
+```
+
+```{r, message=F}
+library(data.table)
+library(dplyr)
+library(parallel)
+library(ggplot2)
+library(ggpubr)
+```
+
+
+### pileup & filtering (chr, read depth >=50)   
+```{r}
+#system('samtools mpileup CLIP-35L33G.bam > CLIP-35L33G.pileup')
+#system("awk '($1 ~ /chr/) && ($4 >= 50) { print $0; }' CLIP-35L33G.pileup > CLIP-35L33G_filter.pileup")
+```
+
+전체로 하려니까 너무 오래걸림. chr별로 나눠서 해보기   
+```{r}
+# system("for i in {1..19} X Y M
+#        do
+#        awk -v chr="chr$i" '$1 == chr { print $0; }' CLIP-35L33G_filter.pileup > CLIP-35L33G_filter_chr${i}.pileup
+#        done")
+```
+
+### chr9만 해보기     
+1. 파일불러오기   
+```{r}
+pileup = fread('clip_pileup/CLIP-35L33G_filter_chr9.pileup')
+colnames(pileup)=c('chrom', 'pos', '_ref', 'count', 'basereads', 'quals')
+head(pileup)
+```
+
+2. match와 substitution외 나머지 tag[<>$*#^] 제거    
+* tag 의미
+  + http://www.htslib.org/doc/samtools-mpileup.html   
+* ^ 다음에는 mapping quality가 나옴 - 같이 제거해줘야하는 거 아님?   
+* -1n -2nn, -3nnn : deletion -> -숫자만 제외? entropy 구할 떄 deletion은 고려한다고 했음.. => N들은 count에는 안포함되는 거 같은데.. ...   
+* +1n : insertion   
+* !!!! deletion, insertion 어떻게 하는건지 확실히 확인해보기    
+
+```{r}
+pileup=pileup%>%
+  mutate(matches0=gsub("[-0-9<>$*#]", "", basereads), 
+         matches=gsub("\\^.", "", matches0), 
+         base_len=nchar(matches))%>%
+  select(-matches0)
+head(pileup[,c("chrom", "pos", "matches", "base_len")])
+```
+3. Shannon entropy 구하기    
+```{r}
+shannon = function(char) {
+  charlen = nchar(char)
+  sum = 0
+  chr_list = strsplit(char, "")[[1]]
+  chr_uniq = unique(strsplit(char, "")[[1]])
+  
+  for (n in chr_uniq) {
+    p=sum(chr_list==n)/charlen
+    plog2p=p*log2(p)
+    sum=sum-plog2p
+  }
+  sum
+}
+
+#example
+shannon('GGGGGGAAAAAAAAGGGGGAAAAAAGCCGCAGGATGAGGTGATAAGGGAGGGGTGAAGGGCGGTGAAGGGGAAAAGAGAAAGAAAAATAAAGGGGGAGTGGGAGGAAGAAGAGAATA')
+
+```
+
+4. Filtering - find binding site    
+```{r}
+pileup=pileup%>%rowwise()%>%
+  mutate(entropy=shannon(matches))
+binding_site=pileup%>%
+  filter(entropy > 0.8 & count > 50)
+summary(pileup$entropy)
+```
+
+5. Genome에서 binding site에 해당하는 위치의 hexmer, 20nt flanking seq list 구하기     
+```{r}
+genome=fread("genome_mm39/chr9.fa.gz")
+genome=paste0(genome[,1]%>%pull, collapse = "")
+```
+
+```{r}
+kmer = function(genome, bd, left=2, right=3) {
+  l = bd - left
+  r = bd + right
+  kmer = substring(genome, l, r)
+  kmer
+}
+
+fs20 = kmer(genome, binding_site$pos, 10, 10)
+```
+
+reverse strand... 그냥 대문자로 바꿔도 되는건가? 일단 바꿔서 해보고 물어보기
+```{r}
+fs20_upper = toupper(fs20)
+fs20_upper = gsub("T", "U", fs20_upper)
+
+AAGNHG = grep("........AAG[AUCG][ACU]G.......", fs20_upper, value=T)
+AAGNGH = grep("........AAG[AUCG]G[ACU].......", fs20_upper, value=T)
+
+```
+
+=> 각 chr 별로 진행, AAGNHG, AAGNGH 20nt 리스트 합치기
+```{r}
+
+byCHR = function(chr) {
+  pileup = fread(paste0('clip_pileup/CLIP-35L33G_filter_chr',chr,'.pileup'))
+  colnames(pileup)=c('chrom', 'pos', '_ref', 'count', 'basereads', 'quals')
+  
+  pileup=pileup%>%
+    mutate(matches0=gsub("[-0-9<>$*#]", "", basereads), 
+           matches=gsub("\\^.", "", matches0), 
+           base_len=nchar(matches))%>%rowwise()%>%
+    mutate(entropy=shannon(matches))
+  binding_site=pileup%>%
+    filter(entropy > 0.8 & count > 50)
+  genome=fread(paste0("genome_mm39/chr",chr,".fa.gz"))
+  genome=paste0(genome[,1]%>%pull, collapse = "")
+  
+  fs20 = kmer(genome, binding_site$pos, 10, 10)
+  
+  fs20_upper = toupper(fs20)
+  fs20_upper = gsub("T", "U", fs20_upper)
+  
+  AAGNHG = grep("........AAG[AUCG][ACU]G.......", fs20_upper, value=T)
+  AAGNGH = grep("........AAG[AUCG]G[ACU].......", fs20_upper, value=T)
+  
+  result=list(fs20=fs20_upper, AAGNHG=AAGNHG, AAGNGH=AAGNGH)
+}
+
+test = mclapply(4:9, byCHR, mc.cores = 5)
+c(1:19, "X", "Y", "M")
+
+fs20_all=vector(); AAGNHG_all=vector(); AAGNGH_all=vector()
+
+for (i in 1:length(test)) {
+  fs20_all = c(fs20_all, test[[i]]$fs20)
+  AAGNHG_all = c(AAGNHG_all, test[[i]]$AAGNHG)
+  AAGNGH_all = c(AAGNGH_all, test[[i]]$AAGNGH)
+}
+
+
+```
+
+
+6. Watson-Crick co-occurence
+```{r}
+# background (permutation 1,000)
+iter_back = function(mat, n) {
+  permute_mat = t(apply(mat, 1, sample, size=ncol(mat)))
+  out = matrix(0, nc=nrow(permute_mat), nr=nrow(permute_mat))
+  for (i in 2:21) {
+    for (j in 1:(i-1)) {
+    out[i,j] = sum(apply(permute_mat[c(i,j),], 2, function(x) paste(x, collapse = "")%in%WCpair))
+    }
+  }
+  out
+}
+
+WCmatrix = function(seqs, seq_len=21, seed=2023, perm_n=1000, core=5) {
+  WCpair = c("AU", "GC", "UA", "CG")
+  WCmat = matrix(0, nc=seq_len, nr=seq_len)
+  backmat = matrix(0, nc=seq_len, nr=seq_len)
+  enrichmat = matrix(nc=seq_len, nr=seq_len)
+  
+  fs_mat = matrix(unlist(strsplit(seqs, "")), nr=seq_len) #열
+  #permute_mat = t(apply(fs_mat, 1, sample, size=ncol(fs_mat)))
+  #table(fs_mat[1,])
+  #table(permute_mat[1,])
+  
+  # co-occurence frequency
+  for (i in 2:21) {
+    for (j in 1:(i-1)) {
+      WCmat[i,j] = sum(apply(fs_mat[c(i,j),], 2, function(x) paste(x, collapse = "")%in%WCpair))
+    }
+  }
+  
+  set.seed(seed)
+  backs = mclapply(1:perm_n, iter_back, mat=fs_mat, mc.cores = core)
+  for (i in 1:perm_n) backmat=backmat+backs[[i]]
+  backmat=backmat/perm_n
+  
+  enrichmat = log2(WCmat/backmat)
+
+}
+
+matAAGNHG=WCmatrix(AAGNHG_all, seq_len=21, seed=2023, perm_n=1000)
+
+matAAGNGH=WCmatrix(AAGNGH_all, seq_len=21, seed=2023, perm_n=1000)
+
+
+
+```
+
+frequency가 0이어서 NAN이나 Inf 나오는거... 0으로 봐도 되나?
+
+```{r}
+
+plot.fun = function(seq_mat, title.txt) {
+  enrichmat = seq_mat
+  enrichmat[is.nan(enrichmat)]=0 
+  enrichmat[is.infinite(enrichmat)]=0
+  enr_plot = data.frame(v1=rep(-10:10, each=21), v2=rep(-10:10, 21), enr=NA)
+  for (i in 1:21) enr_plot$enr[((i-1)*21+1):(i*21)] = enrichmat[,i]
+  enr_plot = enr_plot %>% filter(v1<v2)
+  g = ggplot(enr_plot, aes(x = v2, y = v1, fill = enr)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "dark green", high = "brown", mid="white", 
+                         breaks = log2(c(0.5, 0.75, 1, 1.5, 2)),
+                         labels = c("0.5x", "0.75x",
+                                    "neutral",
+                                    "1.5x", "2x")) +
+    labs(x = "", y = "", title = title.txt,
+         fill = "Normalized relative frequency of WC-pair co-occurrence") +
+    theme_classic() + 
+    scale_y_continuous(position = "right", expand = c(0, 0), 
+                       labels=function(x) ifelse(x==0, "0", sprintf("%+d",x))) +
+    scale_x_continuous(expand = c(0, 0), 
+                       labels=function(x) ifelse(x==0, "0", sprintf("%+d",x)))+
+    theme(legend.position = "bottom", 
+          legend.key.width=unit(2,"cm"), 
+          plot.title = element_text(face="bold", size=18, hjust = 0.5))+
+    guides(fill = guide_colourbar(title.position = "bottom",
+                                  title.hjust = 0.5))
+  g
+}
+
+plot.AAGNHG = plot.fun(matAAGNHG, "AAGNHG")
+plot.AAGNGH = plot.fun(matAAGNGH, "AAGNGH")
+ggarrange(plot.AAGNHG, plot.AAGNGH, ncol=2, common.legend = TRUE, legend="bottom")
+
+```
+
+
+```{r}
+## Weblogo에 올리기
+write.table(fs20_all, "result/fs20.seq", col.names = F, row.names = F, quote = F)
+write.table(AAGNHG_all, "result/AAGNHG.seq", col.names = F, row.names = F, quote = F)
+write.table(AAGNGH_all, "result/AAGNGH.seq", col.names = F, row.names = F, quote = F)
+
+```
+
+
