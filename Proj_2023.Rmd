@@ -5,7 +5,7 @@ output: html_document
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-setwd('/home2/geyie/BIcourse/')
+setwd('/home2/geyie/BIcourse/2023_1')
 ```
 
 ```{r, message=F}
@@ -34,7 +34,7 @@ library(ggpubr)
 ### chr9만 해보기     
 1. 파일불러오기   
 ```{r}
-pileup = fread('CLIP-35L33G_filter_chr9.pileup')
+pileup = fread('clip_pileup/CLIP-35L33G_filter_chr9.pileup')
 colnames(pileup)=c('chrom', 'pos', '_ref', 'count', 'basereads', 'quals')
 head(pileup)
 ```
@@ -87,7 +87,7 @@ summary(pileup$entropy)
 
 5. Genome에서 binding site에 해당하는 위치의 hexmer, 20nt flanking seq list 구하기     
 ```{r}
-genome=fread("chr9.fa.gz")
+genome=fread("genome_mm39/chr9.fa.gz")
 genome=paste0(genome[,1]%>%pull, collapse = "")
 ```
 
@@ -116,7 +116,7 @@ AAGNGH = grep("........AAG[AUCG]G[ACU].......", fs20_upper, value=T)
 ```{r}
 
 byCHR = function(chr) {
-  pileup = fread(paste0('CLIP-35L33G_filter_chr',chr,'.pileup'))
+  pileup = fread(paste0('clip_pileup/CLIP-35L33G_filter_chr',chr,'.pileup'))
   colnames(pileup)=c('chrom', 'pos', '_ref', 'count', 'basereads', 'quals')
   
   pileup=pileup%>%
@@ -126,7 +126,7 @@ byCHR = function(chr) {
     mutate(entropy=shannon(matches))
   binding_site=pileup%>%
     filter(entropy > 0.8 & count > 50)
-  genome=fread(paste0("chr",chr,".fa.gz"))
+  genome=fread(paste0("genome_mm39/chr",chr,".fa.gz"))
   genome=paste0(genome[,1]%>%pull, collapse = "")
   
   fs20 = kmer(genome, binding_site$pos, 10, 10)
