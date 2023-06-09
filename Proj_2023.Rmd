@@ -14,6 +14,7 @@ library(dplyr)
 library(parallel)
 library(ggplot2)
 library(ggpubr)
+library(stringi)
 ```
 
 
@@ -54,17 +55,23 @@ pileup=pileup%>%
          base_len=nchar(matches))%>%
   select(-matches0)
 head(pileup[,c("chrom", "pos", "matches", "base_len")])
+
+#strand 확인 & 대소문자 섞인 게 있는지 확인
+pileup$strand = pileup$matches==toupper(pileup$matches)
+#check = pileup %>% filter(!strand & grepl("^[[:upper:]]+$", matches))
 ```
 3. Shannon entropy 구하기    
 ```{r}
 shannon = function(char) {
-  charlen = nchar(char)
-  sum = 0
-  chr_list = strsplit(char, "")[[1]]
-  chr_uniq = unique(strsplit(char, "")[[1]])
+  ntdel = c("A", "a", "T", "t", "G", "g", "C", "c", "N", "n")
+  chr_all = strsplit(char, "")[[1]]
+  chr_ntdel = chr_all[chr_all%in%ntdel]
+  chr_uniq = unique(chr_ntdel)
+  charlen = length(chr_ntdel)
   
+  sum = 0
   for (n in chr_uniq) {
-    p=sum(chr_list==n)/charlen
+    p=sum(chr_ntdel==n)/charlen
     plog2p=p*log2(p)
     sum=sum-plog2p
   }
@@ -89,20 +96,36 @@ summary(pileup$entropy)
 ```{r}
 genome=fread("genome_mm39/chr9.fa.gz")
 genome=paste0(genome[,1]%>%pull, collapse = "")
+
+binding_site$`_ref` = stri_sub(genome, binding_site$pos, binding_site$pos)
+table(binding_site$`_ref`, binding_site$strand)
+head(binding_site[order(binding_site$entropy,decreasing = T),c("chrom","pos","_ref","strand", "entropy", "count")])
 ```
 
 ```{r}
-kmer = function(genome, bd, left=2, right=3) {
-  l = bd - left
-  r = bd + right
-  kmer = substring(genome, l, r)
+kmer = function(genome, bd, left=2, right=3, strand=T) {
+  if (strand) {
+    l = bd - left
+    r = bd + right
+    kmer = stri_sub(genome, l, r)
+  }else {
+    l = bd - right
+    r = bd + left
+    kmer_com = stri_reverse(stri_sub(genome, l, r))
+    kmer = stri_replace_all_regex(kmer_com, c("a", "t", "g", "c", "A", "T", "G", "C"), 
+                                  c("Q", "W", "E", "Y", "Q", "W", "E", "Y"), vectorize=FALSE)
+    kmer = stri_replace_all_regex(kmer, c("Q", "W", "E", "Y"), c("T", "A", "C", "G"), vectorize=FALSE)
+  }
   kmer
 }
 
-fs20 = kmer(genome, binding_site$pos, 10, 10)
+
+fs20_plus = kmer(genome, binding_site$pos[binding_site$strand], 10, 10, T)
+fs20_minus = kmer(genome, binding_site$pos[!binding_site$strand], 10, 10, F)
+fs20 = c(fs20_plus, fs20_minus)
 ```
 
-reverse strand... 그냥 대문자로 바꿔도 되는건가? 일단 바꿔서 해보고 물어보기
+소문자: repeat masking (소문자 있는 것 제거하거나 대문자로 바꿔서)
 ```{r}
 fs20_upper = toupper(fs20)
 fs20_upper = gsub("T", "U", fs20_upper)
@@ -120,17 +143,22 @@ byCHR = function(chr) {
   colnames(pileup)=c('chrom', 'pos', '_ref', 'count', 'basereads', 'quals')
   
   pileup=pileup%>%
-    mutate(matches0=gsub("[-0-9<>$*#]", "", basereads), 
+    mutate(matches0=gsub("[-0-9<>$*#+]", "", basereads), 
            matches=gsub("\\^.", "", matches0), 
            base_len=nchar(matches))%>%rowwise()%>%
     mutate(entropy=shannon(matches))
+  pileup$strand = pileup$matches==toupper(pileup$matches)
+
   binding_site=pileup%>%
-    filter(entropy > 0.8 & count > 50)
+    filter(entropy > 0.8 & count > 50 & base_len > 50)
   genome=fread(paste0("genome_mm39/chr",chr,".fa.gz"))
   genome=paste0(genome[,1]%>%pull, collapse = "")
   
-  fs20 = kmer(genome, binding_site$pos, 10, 10)
-  
+  pos_plus = binding_site$pos[binding_site$strand]
+  pos_minus = binding_site$pos[!binding_site$strand]
+  fs20_plus = kmer(genome, pos_plus, 10, 10, T)
+  fs20_minus = kmer(genome, pos_minus, 10, 10, F)
+  fs20 = c(fs20_plus, fs20_minus)  
   fs20_upper = toupper(fs20)
   fs20_upper = gsub("T", "U", fs20_upper)
   
@@ -138,10 +166,10 @@ byCHR = function(chr) {
   AAGNGH = grep("........AAG[AUCG]G[ACU].......", fs20_upper, value=T)
   
   result=list(fs20=fs20_upper, AAGNHG=AAGNHG, AAGNGH=AAGNGH)
+  result
 }
 
-test = mclapply(4:9, byCHR, mc.cores = 5)
-c(1:19, "X", "Y", "M")
+test = mclapply(1:19, byCHR, mc.cores = 10)
 
 fs20_all=vector(); AAGNHG_all=vector(); AAGNGH_all=vector()
 
@@ -150,8 +178,6 @@ for (i in 1:length(test)) {
   AAGNHG_all = c(AAGNHG_all, test[[i]]$AAGNHG)
   AAGNGH_all = c(AAGNGH_all, test[[i]]$AAGNGH)
 }
-
-
 ```
 
 
@@ -169,16 +195,13 @@ iter_back = function(mat, n) {
   out
 }
 
-WCmatrix = function(seqs, seq_len=21, seed=2023, perm_n=1000, core=5) {
+WCmatrix = function(seqs, seq_len=21, seed=2023, perm_n=1000, core=10) {
   WCpair = c("AU", "GC", "UA", "CG")
   WCmat = matrix(0, nc=seq_len, nr=seq_len)
   backmat = matrix(0, nc=seq_len, nr=seq_len)
   enrichmat = matrix(nc=seq_len, nr=seq_len)
   
   fs_mat = matrix(unlist(strsplit(seqs, "")), nr=seq_len) #열
-  #permute_mat = t(apply(fs_mat, 1, sample, size=ncol(fs_mat)))
-  #table(fs_mat[1,])
-  #table(permute_mat[1,])
   
   # co-occurence frequency
   for (i in 2:21) {
@@ -192,26 +215,30 @@ WCmatrix = function(seqs, seq_len=21, seed=2023, perm_n=1000, core=5) {
   for (i in 1:perm_n) backmat=backmat+backs[[i]]
   backmat=backmat/perm_n
   
-  enrichmat = log2(WCmat/backmat)
+  enrichmat = log2((WCmat+1)/(backmat+1))
+  
+  result = list(WCobs = WCmat, 
+                background = backmat, 
+                enrich = enrichmat)
 
 }
 
-matAAGNHG=WCmatrix(AAGNHG_all, seq_len=21, seed=2023, perm_n=1000)
+coAAGNHG=WCmatrix(AAGNHG_all, seq_len=21, seed=2023, perm_n=1000)
+coAAGNGH=WCmatrix(AAGNGH_all, seq_len=21, seed=2023, perm_n=1000)
 
-matAAGNGH=WCmatrix(AAGNGH_all, seq_len=21, seed=2023, perm_n=1000)
-
-
+matAAGNHG = coAAGNHG$enrich
+matAAGNGH = coAAGNGH$enrich
 
 ```
 
-frequency가 0이어서 NAN이나 Inf 나오는거... 0으로 봐도 되나?
+frequency가 0이어서 NAN이나 Inf 나오는거... 0으로 봐도 되나? (pseudo count로 처리)
 
 ```{r}
 
 plot.fun = function(seq_mat, title.txt) {
   enrichmat = seq_mat
-  enrichmat[is.nan(enrichmat)]=0 
-  enrichmat[is.infinite(enrichmat)]=0
+  #enrichmat[is.nan(enrichmat)]=0 
+  #enrichmat[is.infinite(enrichmat)]=0
   enr_plot = data.frame(v1=rep(-10:10, each=21), v2=rep(-10:10, 21), enr=NA)
   for (i in 1:21) enr_plot$enr[((i-1)*21+1):(i*21)] = enrichmat[,i]
   enr_plot = enr_plot %>% filter(v1<v2)
@@ -241,14 +268,73 @@ plot.AAGNHG = plot.fun(matAAGNHG, "AAGNHG")
 plot.AAGNGH = plot.fun(matAAGNGH, "AAGNGH")
 ggarrange(plot.AAGNHG, plot.AAGNGH, ncol=2, common.legend = TRUE, legend="bottom")
 
+ggsave(file = "result/Fig2E.png", dpi=300, height=4, width=7, units="in")
+ggarrange(plot.AAGNHG, plot.AAGNGH, ncol=2, common.legend = TRUE, legend="bottom")
+dev.off()
 ```
 
-
+7. WebLogo
+https://weblogo.berkeley.edu/logo.cgi
 ```{r}
 ## Weblogo에 올리기
 write.table(fs20_all, "result/fs20.seq", col.names = F, row.names = F, quote = F)
 write.table(AAGNHG_all, "result/AAGNHG.seq", col.names = F, row.names = F, quote = F)
 write.table(AAGNGH_all, "result/AAGNGH.seq", col.names = F, row.names = F, quote = F)
+
+```
+
+
+8. significance test
+```{r}
+#background matrix 각각 저장
+WCmatrix = function(seqs, seq_len=21, seed=2023, perm_n=1000, core=10) {
+  WCpair = c("AU", "GC", "UA", "CG")
+  WCmat = matrix(0, nc=seq_len, nr=seq_len)
+  backmat = matrix(0, nc=seq_len, nr=seq_len)
+  enrichmat = matrix(nc=seq_len, nr=seq_len)
+  
+  fs_mat = matrix(unlist(strsplit(seqs, "")), nr=seq_len) #열
+  #permute_mat = t(apply(fs_mat, 1, sample, size=ncol(fs_mat)))
+  #table(fs_mat[1,])
+  #table(permute_mat[1,])
+  
+  # co-occurence frequency
+  for (i in 2:21) {
+    for (j in 1:(i-1)) {
+      WCmat[i,j] = sum(apply(fs_mat[c(i,j),], 2, function(x) paste(x, collapse = "")%in%WCpair))
+    }
+  }
+  
+  set.seed(seed)
+  backs = mclapply(1:perm_n, iter_back, mat=fs_mat, mc.cores = core)
+  for (i in 1:perm_n) backmat=backmat+backs[[i]]
+  backmat=backmat/perm_n
+  
+  enrichmat = log2((WCmat+1)/(backmat+1))
+  
+  result = list(WCobs = WCmat, 
+                backs = backs,
+                back_pooled = backmat, 
+                enrich = enrichmat)
+
+}
+
+coAAGNHG=WCmatrix(AAGNHG_all, seq_len=21, seed=2023, perm_n=1000)
+
+## plot : distribution of WC pair freq (when Null = True) + observed freq. (일부만)
+
+xpos=15;ypos=8 #15(+), 8(-)
+xpos=21;ypos=20 
+xpos=20;ypos=7 
+frq_back = sapply(coAAGNHG$backs, function(x) x[xpos, ypos])
+frq_obs = coAAGNHG$WCobs[xpos, ypos]
+sum(frq_back>=frq_obs)/length(frq_back)
+
+ggplot(data.frame(Frequency=frq_back), aes(x = Frequency)) +
+  geom_histogram(binwidth = 5, fill = "white", color = "black") + xlim((min(min(frq_back), frq_obs))-10, max(max(frq_back), frq_obs)+10) +
+  labs(x = "WC pair freq", y = "Frequency") +
+  theme_minimal()+
+  geom_vline(xintercept = frq_obs, color = "red", linetype = "dashed", size = 1)
 
 ```
 
